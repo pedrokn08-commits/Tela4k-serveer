@@ -1,0 +1,9 @@
+# Blueprint do Render: cria o servidor de salas no plano gratuito.
+services:
+  - type: web
+    name: tela4k-salas
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
