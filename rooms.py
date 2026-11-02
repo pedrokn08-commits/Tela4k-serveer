@@ -1,17 +1,18 @@
-"""Logica das salas do Tela4K (sem dependencias externas, para ser testada sozinha).
+"""Logica das salas do Tela4K, estilo Discord (sem dependencias externas, para ser testada sozinha).
 
-Etapa 1: criar sala, gerar codigo de convite, entrar, listar participantes, fechar a sala
-quando o anfitriao sai. Nenhum video passa por aqui.
+- Existem salas FIXAS (sempre na lista, mesmo vazias) e salas CRIADAS pelos usuarios (somem quando ficam vazias).
+- Quem se conecta ve a lista de salas e clica para entrar: nao ha codigo de convite.
+- Dentro da sala todos sao iguais: qualquer um pode transmitir (varios ao mesmo tempo) e assistir quando quiser.
+Nenhum video passa por aqui; so quem esta em qual sala e quem esta transmitindo.
 """
 import re
-import secrets
-import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 
-# Sem 0/O e 1/I/L, para o codigo nao ser confundido ao ser lido ou digitado.
-ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-CODE_LEN = 6
+DEFAULT_FIXED = ["Jogos", "Valorant", "Filmes e séries", "Bate-papo"]
+MAX_MEMBER_NAME = 24
+MAX_ROOM_NAME = 28
 
 
 class RoomError(Exception):
@@ -21,109 +22,152 @@ class RoomError(Exception):
         self.message = message
 
 
-@dataclass
-class Member:
-    id: str
-    name: str
-    role: str  # "host" ou "viewer"
-
-
-@dataclass
-class Room:
-    code: str
-    host_id: str
-    members: dict = field(default_factory=dict)
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class Left:
-    room_code: str
-    was_host: bool
-    others: list  # ids que continuam conectados a essa sala (no caso do anfitriao: serao desconectados)
-
-
-def clean_name(name, default):
-    name = re.sub(r"[\x00-\x1f\x7f]", "", str(name or ""))
-    name = re.sub(r"\s+", " ", name).strip()[:24]
-    return name or default
-
-
-def normalize_code(code):
-    return "".join(c for c in str(code or "").upper() if c in ALPHABET)
-
-
 def new_member_id():
     return uuid.uuid4().hex[:12]
 
 
-class RoomManager:
-    def __init__(self, max_rooms=200, max_members=10):
-        self.max_rooms = max_rooms
-        self.max_members = max_members
-        self.rooms = {}       # codigo -> Room
-        self.member_room = {}  # id do membro -> codigo
+def clean_name(name, default="Convidado", limit=MAX_MEMBER_NAME):
+    """Tira caracteres de controle e espacos repetidos; nome vazio vira o padrao."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(name or ""))
+    text = re.sub(r"\s+", " ", text).strip()[:limit].strip()
+    return text or default
 
+
+def room_key(name):
+    """Identificador da sala: sem acento, minusculo, espacos normalizados ("Filmes e séries" -> "filmes e series")."""
+    text = unicodedata.normalize("NFKD", str(name or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+@dataclass
+class Member:
+    id: str
+    name: str
+    room: str = None          # id da sala em que esta (None = so olhando a lista)
+    streaming: bool = False   # esta transmitindo a tela agora?
+
+
+@dataclass
+class Room:
+    id: str
+    name: str
+    fixed: bool = False
+    members: dict = field(default_factory=dict)   # id -> Member, na ordem de entrada
+
+
+@dataclass
+class Left:
+    room_id: str
+    closed: bool   # True: era uma sala criada e ficou vazia, entao foi apagada
+
+
+class RoomManager:
+    def __init__(self, fixed=None, max_members=10, max_rooms=50):
+        self.max_members, self.max_rooms = max_members, max_rooms
+        self.rooms = {}      # id -> Room (fixas primeiro, depois as criadas)
+        self.members = {}    # id -> Member (todos os conectados)
+        for name in (DEFAULT_FIXED if fixed is None else fixed):
+            name = clean_name(name, default="", limit=MAX_ROOM_NAME)
+            if name and room_key(name) not in self.rooms:
+                self.rooms[room_key(name)] = Room(room_key(name), name, fixed=True)
+
+    # ---------------------------------------------------------------- conexao
+    def connect(self, member_id, name=""):
+        member = Member(member_id, clean_name(name))
+        self.members[member_id] = member
+        return member
+
+    def disconnect(self, member_id):
+        """Remove o membro de tudo. Devolve Left (sala que ele deixou) ou None."""
+        left = self._leave(member_id)
+        self.members.pop(member_id, None)
+        return left
+
+    def rename(self, member_id, name):
+        member = self.members.get(member_id)
+        if member is not None and str(name or "").strip():
+            member.name = clean_name(name)
+
+    # ---------------------------------------------------------------- salas
+    def _leave(self, member_id):
+        member = self.members.get(member_id)
+        if member is None or member.room is None:
+            return None
+        room = self.rooms.get(member.room)
+        member.room, member.streaming = None, False
+        if room is None:
+            return None
+        room.members.pop(member_id, None)
+        if not room.fixed and not room.members:
+            del self.rooms[room.id]
+            return Left(room.id, True)
+        return Left(room.id, False)
+
+    def leave_room(self, member_id):
+        if member_id not in self.members:
+            raise RoomError("unknown", "Conexão desconhecida.")
+        return self._leave(member_id)
+
+    def _enter(self, member, room):
+        room.members[member.id] = member
+        member.room = room.id
+
+    def join_room(self, member_id, room_id):
+        """Entra numa sala existente (saindo da anterior). Devolve (sala, Left da sala anterior ou None)."""
+        member = self.members.get(member_id)
+        if member is None:
+            raise RoomError("unknown", "Conexão desconhecida.")
+        room = self.rooms.get(room_key(room_id))
+        if room is None:
+            raise RoomError("not_found", "Essa sala não existe mais.")
+        if member.room == room.id:
+            return room, None
+        if len(room.members) >= self.max_members:   # confere ANTES de sair da sala atual
+            raise RoomError("room_full", f"A sala \"{room.name}\" está cheia ({self.max_members} pessoas).")
+        left = self._leave(member_id)
+        self._enter(member, room)
+        return room, left
+
+    def create_room(self, member_id, room_name):
+        """Cria uma sala nova e entra nela. Devolve (sala, Left da sala anterior ou None)."""
+        member = self.members.get(member_id)
+        if member is None:
+            raise RoomError("unknown", "Conexão desconhecida.")
+        name = clean_name(room_name, default="", limit=MAX_ROOM_NAME)
+        if not name:
+            raise RoomError("bad_name", "Digite um nome para a sala.")
+        key = room_key(name)
+        if key in self.rooms:
+            raise RoomError("exists", f"Já existe uma sala chamada \"{self.rooms[key].name}\".")
+        if sum(1 for r in self.rooms.values() if not r.fixed) >= self.max_rooms:
+            raise RoomError("too_many", "Há salas demais abertas agora. Entre em uma existente.")
+        left = self._leave(member_id)
+        room = Room(key, name, fixed=False)
+        self.rooms[key] = room
+        self._enter(member, room)
+        return room, left
+
+    def set_streaming(self, member_id, on):
+        member = self.members.get(member_id)
+        if member is None or member.room is None:
+            raise RoomError("not_in_room", "Entre em uma sala para transmitir.")
+        member.streaming = bool(on)
+        return member.room
+
+    def same_room(self, a, b):
+        """True se os dois estao na mesma sala (so assim o servidor repassa sinalizacao entre eles)."""
+        ma, mb = self.members.get(a), self.members.get(b)
+        return bool(ma and mb and a != b and ma.room is not None and ma.room == mb.room)
+
+    # ---------------------------------------------------------------- resumos para enviar aos clientes
     def room_count(self):
         return len(self.rooms)
 
-    def _new_code(self):
-        for _ in range(50):
-            code = "".join(secrets.choice(ALPHABET) for _ in range(CODE_LEN))
-            if code not in self.rooms:
-                return code
-        raise RoomError("server_busy", "Não consegui gerar um código agora. Tente de novo.")
-
-    def create(self, name, member_id):
-        if member_id in self.member_room:
-            raise RoomError("already_in_room", "Você já está em uma sala.")
-        if len(self.rooms) >= self.max_rooms:
-            raise RoomError("server_full", "O servidor atingiu o limite de salas. Tente mais tarde.")
-        code = self._new_code()
-        room = Room(code=code, host_id=member_id)
-        room.members[member_id] = Member(member_id, clean_name(name, "Anfitrião"), "host")
-        self.rooms[code] = room
-        self.member_room[member_id] = code
-        return room
-
-    def join(self, code, name, member_id):
-        if member_id in self.member_room:
-            raise RoomError("already_in_room", "Você já está em uma sala.")
-        norm = normalize_code(code)
-        room = self.rooms.get(norm) if len(norm) == CODE_LEN else None
-        if room is None:
-            raise RoomError("not_found", "Sala não encontrada. Confira o código.")
-        if len(room.members) >= self.max_members:
-            raise RoomError("room_full", f"A sala está cheia (máximo {self.max_members} pessoas).")
-        room.members[member_id] = Member(member_id, clean_name(name, "Convidado"), "viewer")
-        self.member_room[member_id] = norm
-        return room
-
-    def leave(self, member_id):
-        code = self.member_room.pop(member_id, None)
-        room = self.rooms.get(code) if code else None
-        if room is None:
-            return None
-        member = room.members.pop(member_id, None)
-        if member is None:
-            return None
-        if member.role == "host":
-            others = list(room.members)
-            for mid in others:
-                self.member_room.pop(mid, None)
-            del self.rooms[code]
-            return Left(code, True, others)
-        return Left(code, False, list(room.members))
-
-    def same_room(self, a, b):
-        """True se os dois membros estao na mesma sala (so assim o servidor repassa sinalizacao entre eles)."""
-        ca = self.member_room.get(a)
-        return ca is not None and a != b and ca == self.member_room.get(b)
-
     def members_payload(self, room):
-        return [{"id": m.id, "name": m.name, "role": m.role} for m in room.members.values()]
+        return [{"id": m.id, "name": m.name, "streaming": m.streaming} for m in room.members.values()]
 
-    def snapshot(self, room, member_id):
-        return {"code": room.code, "you": member_id,
-                "role": room.members[member_id].role,
-                "members": self.members_payload(room)}
+    def rooms_payload(self):
+        return [{"id": r.id, "name": r.name, "fixed": r.fixed, "count": len(r.members),
+                 "streaming": sum(1 for m in r.members.values() if m.streaming),
+                 "members": [m.name for m in list(r.members.values())[:6]]} for r in self.rooms.values()]
